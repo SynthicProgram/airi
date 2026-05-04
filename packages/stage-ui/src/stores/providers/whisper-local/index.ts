@@ -15,17 +15,19 @@ import whisperWorkerUrl from '../../../workers/whisper/worker?worker&url'
 
 import { removeInferenceStatus, updateInferenceStatus } from '../../../composables/use-inference-status'
 import { createRequestId, InferenceAbortError } from '../../../libs/inference/protocol'
+import { looksLikeWhisperHallucination } from './hallucination-filter'
 
 const DEFAULT_MODEL_ID = 'onnx-community/whisper-base'
 const STATUS_KEY = 'whisper-local'
 
 const TARGET_SAMPLE_RATE = 16_000
 const FRAME_SIZE = 512 // matches the existing VAD worklet's MIN_CHUNK_SIZE
-const SILENCE_RMS_THRESHOLD = 0.01
-const MIN_UTTERANCE_FRAMES = Math.floor((TARGET_SAMPLE_RATE * 0.4) / FRAME_SIZE) // ~400 ms of speech
+const SILENCE_RMS_THRESHOLD = 0.015
+const MIN_UTTERANCE_FRAMES = Math.floor((TARGET_SAMPLE_RATE * 0.4) / FRAME_SIZE) // ~400 ms of voiced speech
 const SILENCE_FRAMES_TO_END = Math.floor((TARGET_SAMPLE_RATE * 0.7) / FRAME_SIZE) // ~700 ms of silence
 const PRE_ROLL_FRAMES = Math.floor((TARGET_SAMPLE_RATE * 0.2) / FRAME_SIZE) // ~200 ms preserved before speech
 const MAX_UTTERANCE_FRAMES = Math.floor((TARGET_SAMPLE_RATE * 25) / FRAME_SIZE) // safety cap ~25 s
+const SPEECH_ENTRY_FRAMES = Math.max(1, Math.floor((TARGET_SAMPLE_RATE * 0.12) / FRAME_SIZE)) // ~120 ms of consecutive voiced frames before opening an utterance
 
 export interface WhisperLocalExtraOptions {
   language?: string
@@ -368,6 +370,8 @@ export function streamWhisperLocalTranscription(
   let activeFrames: Float32Array[] = []
   let inSpeech = false
   let silenceFrames = 0
+  let pendingSpeechFrames = 0
+  let voicedFrameCount = 0
 
   const handle = getWorker(modelId)
 
@@ -413,8 +417,8 @@ export function streamWhisperLocalTranscription(
   // worker (the worker only holds one pipeline at a time).
   let dispatchChain: Promise<void> = Promise.resolve()
 
-  function dispatchUtterance(frames: Float32Array[]) {
-    if (frames.length < MIN_UTTERANCE_FRAMES)
+  function dispatchUtterance(frames: Float32Array[], voicedCount: number) {
+    if (voicedCount < MIN_UTTERANCE_FRAMES)
       return
 
     const audio = concatFrames(frames)
@@ -425,7 +429,7 @@ export function streamWhisperLocalTranscription(
           return
         const text = await handle.transcribe(audio, language, abortSignal)
         const trimmed = text.trim()
-        if (!trimmed)
+        if (looksLikeWhisperHallucination(trimmed))
           return
         fullText += (fullText ? ' ' : '') + trimmed
         textStreamCtrl?.enqueue(trimmed)
@@ -447,26 +451,39 @@ export function streamWhisperLocalTranscription(
     if (!inSpeech) {
       preRoll.push(frame)
       if (isSpeech) {
-        inSpeech = true
-        silenceFrames = 0
-        activeFrames = preRoll.drain()
-        activeFrames.push(frame)
+        pendingSpeechFrames++
+        if (pendingSpeechFrames >= SPEECH_ENTRY_FRAMES) {
+          inSpeech = true
+          silenceFrames = 0
+          activeFrames = preRoll.drain()
+          // The recent consecutive voiced frames (already in activeFrames via
+          // preRoll) are what cleared the entry threshold.
+          voicedFrameCount = pendingSpeechFrames
+          pendingSpeechFrames = 0
+        }
+      }
+      else {
+        pendingSpeechFrames = 0
       }
     }
     else {
       activeFrames.push(frame)
       if (isSpeech) {
         silenceFrames = 0
+        voicedFrameCount++
       }
       else {
         silenceFrames++
         if (silenceFrames >= SILENCE_FRAMES_TO_END || activeFrames.length >= MAX_UTTERANCE_FRAMES) {
           const utterance = activeFrames
+          const voiced = voicedFrameCount
           activeFrames = []
           inSpeech = false
           silenceFrames = 0
+          voicedFrameCount = 0
+          pendingSpeechFrames = 0
           preRoll.reset()
-          dispatchUtterance(utterance)
+          dispatchUtterance(utterance, voiced)
         }
       }
     }
