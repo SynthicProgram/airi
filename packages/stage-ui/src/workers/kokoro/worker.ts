@@ -70,7 +70,7 @@ export type KokoroInferenceOutput = KokoroGenerateOutput | KokoroVoicesOutput
 // the last 22050 output frames as a seek-history window, so a forward-only
 // consumer never gets the tail (cut-off at low pitch) and stale history reads
 // produce echo/choppiness at high pitch.
-function shiftPitchSemitones(samples: Float32Array, semitones: number): Float32Array {
+function shiftPitchSemitones(samples: Float32Array, semitones: number, sampleRate: number): Float32Array {
   const numFrames = samples.length
 
   // Up-mix mono Float32 to stereo interleaved (soundtouchjs is stereo-only).
@@ -81,6 +81,12 @@ function shiftPitchSemitones(samples: Float32Array, semitones: number): Float32A
   }
 
   const st = new SoundTouch()
+  // Stretch defaults to 44.1 kHz; mismatched rate makes the seek-window /
+  // overlap-add operate over the wrong frame counts, which is most audible at
+  // high pitch (echo / choppiness). Configure for the real sample rate before
+  // setting pitch so sampleReq is recomputed against it.
+  // Args: (sampleRate, sequenceMs=0 → auto, seekWindowMs=0 → auto, overlapMs)
+  st.stretch.setParameters(sampleRate, 0, 0, 8)
   st.pitchSemitones = semitones
 
   const collected: Float32Array[] = []
@@ -338,7 +344,7 @@ async function runInference(request: RunInferenceRequest<KokoroInferenceInput>):
 
     let samples = audioResult.audio
     if (pitch != null && pitch !== 0)
-      samples = shiftPitchSemitones(samples, pitch * 12 / 100)
+      samples = shiftPitchSemitones(samples, pitch * 12 / 100, audioResult.sampling_rate)
 
     // Transfer raw PCM Float32Array directly — avoids WAV blob encode/decode overhead.
     const result: InferenceResultResponse<KokoroGenerateOutput> = {
