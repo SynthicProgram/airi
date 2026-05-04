@@ -17,6 +17,8 @@ import type {
 import type { VoiceKey, Voices } from './types'
 
 import { KokoroTTS } from 'kokoro-js'
+// @ts-expect-error — soundtouchjs ships without type declarations
+import { SoundTouch } from 'soundtouchjs'
 
 import { MODEL_IDS, MODEL_NAMES } from '../../libs/inference/constants'
 import { classifyError, isRecoverable } from '../../libs/inference/protocol'
@@ -29,6 +31,11 @@ export interface KokoroGenerateInput {
   action: 'generate'
   text: string
   voice: VoiceKey
+  // -100..+100 (UI percent). Mapped linearly to ±12 semitones. Applied as DSP
+  // post-processing because kokoro-js has no native pitch parameter.
+  pitch?: number
+  // kokoro-js native speed multiplier (1 = normal). Honored by the model itself.
+  speed?: number
 }
 
 export interface KokoroGetVoicesInput {
@@ -49,6 +56,77 @@ export interface KokoroVoicesOutput {
 }
 
 export type KokoroInferenceOutput = KokoroGenerateOutput | KokoroVoicesOutput
+
+// ---------------------------------------------------------------------------
+// Pitch shift (DSP)
+// ---------------------------------------------------------------------------
+
+// kokoro-js has no native pitch parameter, so we post-process its mono PCM
+// output through soundtouchjs (TDHS overlap-add) to shift pitch while
+// preserving duration. Mapping: pitchPercent * 12 / 100 → semitones, so the
+// -100..+100 slider covers ±1 octave symmetrically.
+//
+// We drive SoundTouch directly instead of via SimpleFilter: SimpleFilter holds
+// the last 22050 output frames as a seek-history window, so a forward-only
+// consumer never gets the tail (cut-off at low pitch) and stale history reads
+// produce echo/choppiness at high pitch.
+function shiftPitchSemitones(samples: Float32Array, semitones: number): Float32Array {
+  const numFrames = samples.length
+
+  // Up-mix mono Float32 to stereo interleaved (soundtouchjs is stereo-only).
+  const stereo = new Float32Array(numFrames * 2)
+  for (let i = 0; i < numFrames; i++) {
+    stereo[i * 2] = samples[i]
+    stereo[i * 2 + 1] = samples[i]
+  }
+
+  const st = new SoundTouch()
+  st.pitchSemitones = semitones
+
+  const collected: Float32Array[] = []
+
+  function drain(): void {
+    while (st.outputBuffer.frameCount > 0) {
+      const have = st.outputBuffer.frameCount
+      const buf = new Float32Array(have * 2)
+      st.outputBuffer.receiveSamples(buf, have)
+      const mono = new Float32Array(have)
+      for (let i = 0; i < have; i++)
+        mono[i] = buf[i * 2]
+      collected.push(mono)
+    }
+  }
+
+  // Push input in chunks, processing incrementally so the inputBuffer never
+  // grows huge for long clips.
+  const CHUNK = 4096
+  for (let pos = 0; pos < numFrames; pos += CHUNK) {
+    const len = Math.min(CHUNK, numFrames - pos)
+    st.inputBuffer.putSamples(stereo, pos, len)
+    st.process()
+    drain()
+  }
+
+  // Stretch.process() only emits when inputBuffer >= sampleReq frames, so any
+  // residual real samples below that threshold are stranded. Pad with silence
+  // to push the residual past the threshold, then trim the trailing silence
+  // off the output (pitch shift preserves duration → output length == input).
+  const FLUSH = 16384
+  const silence = new Float32Array(FLUSH * 2)
+  st.inputBuffer.putSamples(silence, 0, FLUSH)
+  st.process()
+  drain()
+
+  let total = 0
+  for (const c of collected) total += c.length
+  const out = new Float32Array(total)
+  let offset = 0
+  for (const c of collected) {
+    out.set(c, offset)
+    offset += c.length
+  }
+  return out.length > numFrames ? out.slice(0, numFrames) : out
+}
 
 // ---------------------------------------------------------------------------
 // Model singleton
@@ -249,16 +327,20 @@ async function runInference(request: RunInferenceRequest<KokoroInferenceInput>):
     if (!ttsModel)
       throw new Error('Kokoro TTS generation failed: No model loaded.')
 
-    const { text, voice } = input
-    const audioResult = await ttsModel.generate(text, { voice })
+    const { text, voice, pitch, speed } = input
+    // kokoro-js ignores undefined options, so spreading raw values is safe.
+    const audioResult = await ttsModel.generate(text, { voice, speed })
 
     if (isCancelled(requestId)) {
       clearCancelled(requestId)
       return
     }
 
+    let samples = audioResult.audio
+    if (pitch != null && pitch !== 0)
+      samples = shiftPitchSemitones(samples, pitch * 12 / 100)
+
     // Transfer raw PCM Float32Array directly — avoids WAV blob encode/decode overhead.
-    const samples = audioResult.audio
     const result: InferenceResultResponse<KokoroGenerateOutput> = {
       type: 'inference-result',
       requestId,
