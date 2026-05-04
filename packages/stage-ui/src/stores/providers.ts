@@ -1802,8 +1802,18 @@ export const useProvidersStore = defineStore('providers', () => {
                     throw new Error('Voice parameter is required')
                   }
 
+                  // Pull pitch/rate from the global Speech store. Lazy dynamic
+                  // import avoids a top-level circular import (modules/speech.ts
+                  // already imports useProvidersStore from this file). The body
+                  // overrides act as escape hatches for callers that want to
+                  // bypass the store.
+                  const { useSpeechStore } = await import('./modules/speech')
+                  const speechStore = useSpeechStore()
+                  const pitch = body.pitch ?? speechStore.pitch
+                  const speed = body.speed ?? speechStore.rate
+
                   // Generate audio in the worker thread
-                  const buffer = await (await workerManagerPromise).generate(text, voice)
+                  const buffer = await (await workerManagerPromise).generate(text, voice, { pitch, speed })
 
                   return new Response(buffer, {
                     status: 200,

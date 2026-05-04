@@ -109,6 +109,68 @@ describe('classifyError phase integration', () => {
   })
 })
 
+describe('kokoro adapter - pitch/speed forwarding', () => {
+  beforeEach(() => {
+    enqueueMock.mockClear()
+    enqueueMock.mockImplementation((_id: string, _p: number, loader: () => Promise<unknown>) => loader())
+    MockWorker.instances.length = 0
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('should forward pitch and speed in the run-inference postMessage', async () => {
+    const { createKokoroAdapter } = await import('./kokoro')
+    const adapter = createKokoroAdapter()
+
+    // Drive a successful model load so generate() will run.
+    const loading = adapter.loadModel('q4', 'wasm')
+    await vi.waitFor(() => expect(MockWorker.instances.length).toBeGreaterThan(0))
+    const worker = MockWorker.instances.at(-1)!
+
+    await vi.waitFor(() =>
+      expect(worker.postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: 'load-model' })),
+    )
+
+    const loadCall = worker.postMessage.mock.calls
+      .map(c => c[0])
+      .find((m: any) => m.type === 'load-model') as any
+
+    worker.dispatch('message', {
+      data: {
+        type: 'model-ready',
+        requestId: loadCall.requestId,
+        device: 'wasm',
+        metadata: { voices: { af_heart: { language: 'en-us', name: 'Heart', gender: 'Female' } } },
+      },
+    })
+    await loading
+
+    // generate() now reaches postMessage. Don't dispatch the result — terminate
+    // the adapter to reject the pending wait so the test exits cleanly.
+    const generating = adapter.generate('hello', 'af_heart' as any, { pitch: 50, speed: 1.2 }).catch((e: Error) => e)
+
+    await vi.waitFor(() =>
+      expect(worker.postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: 'run-inference' })),
+    )
+
+    const inferenceCall = worker.postMessage.mock.calls
+      .map(c => c[0])
+      .find((m: any) => m.type === 'run-inference') as any
+    expect(inferenceCall.input).toMatchObject({
+      action: 'generate',
+      text: 'hello',
+      voice: 'af_heart',
+      pitch: 50,
+      speed: 1.2,
+    })
+
+    adapter.terminate()
+    void generating
+  })
+})
+
 describe('kokoro adapter - device loss resilience', () => {
   beforeEach(() => {
     recordDeviceLoss.mockClear()

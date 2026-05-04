@@ -40,11 +40,13 @@ export interface KokoroAdapter {
   /**
    * Generate speech audio from text.
    * Pass `options.signal` to cancel; rejects with `InferenceAbortError`.
+   * `pitch` (UI percent, -100..+100) and `speed` (multiplier, 1 = normal) are
+   * forwarded to the worker; pitch is applied as DSP post-processing.
    */
   generate: (
     text: string,
     voice: VoiceKey,
-    options?: { signal?: AbortSignal },
+    options?: { signal?: AbortSignal, pitch?: number, speed?: number },
   ) => Promise<ArrayBuffer>
 
   /** Get the voices from the last loaded model */
@@ -416,7 +418,7 @@ export function createKokoroAdapter(): KokoroAdapter {
   async function generate(
     text: string,
     voice: VoiceKey,
-    options?: { signal?: AbortSignal },
+    options?: { signal?: AbortSignal, pitch?: number, speed?: number },
   ): Promise<ArrayBuffer> {
     throwIfAborted(options?.signal)
     const notReadyError = new Error('Model not loaded. Call loadModel() first.')
@@ -445,7 +447,7 @@ export function createKokoroAdapter(): KokoroAdapter {
       worker.postMessage({
         type: 'run-inference',
         requestId,
-        input: { action: 'generate', text, voice },
+        input: { action: 'generate', text, voice, pitch: options?.pitch, speed: options?.speed },
       })
 
       const response = await resultPromise
