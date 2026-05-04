@@ -17,6 +17,7 @@ import { activeTurnSpan, startSpan } from '../../composables/use-io-tracer'
 import { useProvidersStore } from '../providers'
 import { streamAliyunTranscription } from '../providers/aliyun/stream-transcription'
 import { streamWebSpeechAPITranscription } from '../providers/web-speech-api'
+import { streamWhisperLocalTranscription } from '../providers/whisper-local'
 
 function errorMessage(err: unknown): string {
   const msg = errorMessageFrom(err) ?? String(err)
@@ -326,6 +327,10 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
         && ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window)
     }
 
+    // Browser-local Whisper is also a self-contained streaming provider
+    if (providerId === 'browser-local-whisper')
+      return typeof window !== 'undefined'
+
     return providersStore.getTranscriptionFeatures(providerId).supportsStreamInput
   })
 
@@ -397,6 +402,43 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
       asrSpan.setAttribute(IOAttributes.ASRAbort, !!abort)
       asrSpan.end()
       asrSpan = undefined
+    }
+
+    // Special handling for browser-local Whisper — its streaming result owns
+    // the AudioContext and worker, so let it tear them down via stop().
+    if (session.providerId === 'browser-local-whisper') {
+      try {
+        const reason = new DOMException(abort ? 'Aborted' : 'Stopped', 'AbortError')
+        if (!session.abortController.signal.aborted)
+          session.abortController.abort(reason)
+
+        const result = session.result as { stop?: () => Promise<void> } | undefined
+        if (result?.stop) {
+          try { await result.stop() }
+          catch (err) { console.warn('Error stopping whisper-local session:', err) }
+        }
+      }
+      catch (err) {
+        console.error('Error stopping whisper-local session:', err)
+      }
+
+      if (session.idleTimer)
+        clearTimeout(session.idleTimer)
+
+      streamingSession.value = undefined
+
+      if (session.result?.mode === 'stream') {
+        try {
+          return await session.result.text
+        }
+        catch (err) {
+          if (isExpectedStreamStopError(err))
+            return
+          error.value = errorMessage(err)
+          console.error('Error getting transcription result:', error.value)
+        }
+      }
+      return
     }
 
     // Special handling for Web Speech API
@@ -534,6 +576,92 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
       }
 
       console.info('[Hearing Pipeline] Using provider:', providerId)
+
+      // Special handling for browser-local Whisper — owns its own AudioContext,
+      // VAD chunking, and inference worker. Bypasses the generic worklet path.
+      if (providerId === 'browser-local-whisper') {
+        const existingSession = streamingSession.value
+        if (existingSession && existingSession.providerId === 'browser-local-whisper') {
+          const hasNewCallbacks = haveStreamingCallbacksChanged(existingSession.callbacks, {
+            onSentenceEnd: options?.onSentenceEnd,
+            onSpeechEnd: options?.onSpeechEnd,
+          })
+          if (hasNewCallbacks) {
+            await stopStreamingTranscription(false, providerId)
+          }
+          else {
+            const idleTimeout = options?.idleTimeoutMs ?? 0
+            if (idleTimeout > 0 && existingSession.idleTimer) {
+              clearTimeout(existingSession.idleTimer)
+              existingSession.idleTimer = setTimeout(async () => {
+                await stopStreamingTranscription(false, providerId)
+              }, idleTimeout)
+            }
+            return
+          }
+        }
+
+        if (!activeTranscriptionModel.value) {
+          const models = await providersStore.getModelsForProvider(providerId)
+          activeTranscriptionModel.value = models[0]?.id ?? 'onnx-community/whisper-base'
+        }
+
+        const providerConfig = providersStore.getProviderConfig(providerId) || {}
+        const language = (options?.providerOptions?.language as string)
+          || (providerConfig.language as string)
+          || 'en'
+
+        const abortController = new AbortController()
+        const idleTimeout = options?.idleTimeoutMs ?? 0
+        let idleTimer: ReturnType<typeof setTimeout> | undefined
+        const bumpIdle = () => {
+          if (idleTimeout <= 0)
+            return
+          if (idleTimer)
+            clearTimeout(idleTimer)
+          idleTimer = setTimeout(async () => {
+            await stopStreamingTranscription(false, providerId)
+          }, idleTimeout)
+        }
+
+        const result = streamWhisperLocalTranscription(stream, {
+          language,
+          modelId: activeTranscriptionModel.value,
+          abortSignal: abortController.signal,
+          onSentenceEnd: (delta) => {
+            bumpIdle()
+            if (asrSpan)
+              asrSpan.addEvent(IOEvents.ASRSentenceEnd, { [IOAttributes.ASRText]: delta })
+            options?.onSentenceEnd?.(delta)
+          },
+          onSpeechEnd: (text) => {
+            if (asrSpan) {
+              asrSpan.setAttribute(IOAttributes.ASRText, text)
+              asrSpan.end()
+              asrSpan = undefined
+            }
+            options?.onSpeechEnd?.(text)
+          },
+        })
+
+        streamingSession.value = {
+          audioContext: {} as AudioContext,
+          workletNode: {} as AudioWorkletNode,
+          mediaStreamSource: {} as MediaStreamAudioSourceNode,
+          audioStreamController: undefined,
+          abortController,
+          result: { ...result, mode: 'stream' as const },
+          idleTimer,
+          providerId,
+          callbacks: {
+            onSentenceEnd: options?.onSentenceEnd,
+            onSpeechEnd: options?.onSpeechEnd,
+          },
+        } as any
+
+        bumpIdle()
+        return
+      }
 
       // Special handling for Web Speech API - it works directly with MediaStream
       if (providerId === 'browser-web-speech-api') {

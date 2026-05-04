@@ -902,6 +902,9 @@ pages:
       browser-local-audio-transcription:
         title: Browser (Local)
         description: https://github.com/moeru-ai/xsai-transformers
+      browser-local-whisper:
+        title: Whisper (Local, In-Browser)
+        description: Runs Whisper in your browser via WebGPU. No API, no server, fully offline after first model download.
       browser-local-audio-speech:
         title: Browser (Local)
         description: https://github.com/moeru-ai/xsai-transformers

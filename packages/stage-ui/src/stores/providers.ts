@@ -58,6 +58,7 @@ import { models as elevenLabsModels } from './providers/elevenlabs/list-models'
 import { buildOpenAICompatibleProvider } from './providers/openai-compatible-builder'
 import { buildOpenRouterAudioSpeechProvider } from './providers/openrouter/audio-speech'
 import { createWebSpeechAPIProvider } from './providers/web-speech-api'
+import { createWhisperLocalProvider } from './providers/whisper-local'
 
 const ALIYUN_NLS_REGIONS = [
   'cn-shanghai',
@@ -914,6 +915,55 @@ export const useProvidersStore = defineStore('providers', () => {
             valid: true,
           }
         },
+      },
+    },
+    'browser-local-whisper': {
+      id: 'browser-local-whisper',
+      category: 'transcription',
+      tasks: ['speech-to-text', 'automatic-speech-recognition', 'asr', 'stt', 'streaming-transcription'],
+      nameKey: 'settings.pages.providers.provider.browser-local-whisper.title',
+      name: 'Whisper (Local, In-Browser)',
+      descriptionKey: 'settings.pages.providers.provider.browser-local-whisper.description',
+      description: 'Runs OpenAI Whisper directly in your browser via WebGPU. No API key, no server, fully offline after first model download.',
+      icon: 'i-lobe-icons:huggingface',
+      defaultOptions: () => ({ language: 'en', modelId: 'onnx-community/whisper-base' }),
+      transcriptionFeatures: {
+        supportsGenerate: true,
+        supportsStreamOutput: true,
+        supportsStreamInput: true,
+      },
+      requiresCredentials: false,
+      pricing: 'free',
+      deployment: 'local',
+      isAvailableBy: async () => {
+        // Browser context required (web or Electron renderer). Mobile (Capacitor)
+        // is excluded — WebGPU support there is too unreliable for v1.
+        if (typeof window === 'undefined')
+          return false
+        if (import.meta.env.RUNTIME_ENVIRONMENT === 'capacitor')
+          return false
+
+        const webGPUAvailable = await isWebGPUSupported()
+        if (webGPUAvailable)
+          return true
+
+        // WASM fallback — require enough RAM to hold the model.
+        if ('navigator' in globalThis && 'deviceMemory' in globalThis.navigator && typeof globalThis.navigator.deviceMemory === 'number') {
+          return globalThis.navigator.deviceMemory >= 8
+        }
+        return false
+      },
+      createProvider: async config => createWhisperLocalProvider(config),
+      capabilities: {
+        listModels: async () => [
+          { id: 'onnx-community/whisper-base', name: 'Whisper Base (~150 MB)', provider: 'browser-local-whisper', contextLength: 0, deprecated: false },
+          { id: 'onnx-community/whisper-tiny', name: 'Whisper Tiny (~75 MB)', provider: 'browser-local-whisper', contextLength: 0, deprecated: false },
+          { id: 'onnx-community/whisper-small', name: 'Whisper Small (~500 MB)', provider: 'browser-local-whisper', contextLength: 0, deprecated: false },
+        ],
+      },
+      validators: {
+        chatPingCheckAvailable: false,
+        validateProviderConfig: () => ({ errors: [], reason: '', valid: true }),
       },
     },
     'elevenlabs': {
@@ -1981,15 +2031,16 @@ export const useProvidersStore = defineStore('providers', () => {
     if (!metadata)
       return false
 
-    // Web Speech API doesn't require credentials - use empty config if not present
-    if (providerId === 'browser-web-speech-api') {
+    // No-credential providers (Web Speech API, browser-local-whisper) seed an empty
+    // config so validation has something to look at and auto-configure proceeds.
+    if (metadata.requiresCredentials === false || providerId === 'browser-web-speech-api') {
       if (!providerCredentials.value[providerId]) {
         providerCredentials.value[providerId] = getDefaultProviderConfig(providerId)
       }
     }
 
     const config = providerCredentials.value[providerId]
-    if (!config && providerId !== 'browser-web-speech-api')
+    if (!config && metadata.requiresCredentials !== false && providerId !== 'browser-web-speech-api')
       return false
 
     const configString = JSON.stringify(config || {})
@@ -2018,8 +2069,8 @@ export const useProvidersStore = defineStore('providers', () => {
       if (providerRuntimeState.value[providerId]) {
         providerRuntimeState.value[providerId].isConfigured = validationResult.valid
         providerRuntimeState.value[providerId].validatedCredentialHash = configString
-        // Auto-mark Web Speech API as added if valid and available
-        if (validationResult.valid && ['browser-web-speech-api', 'player2'].includes(providerId)) {
+        // Auto-mark no-credential providers as added if valid and available
+        if (validationResult.valid && ['browser-web-speech-api', 'browser-local-whisper', 'player2'].includes(providerId)) {
           markProviderAdded(providerId)
         }
       }
