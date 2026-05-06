@@ -37,6 +37,7 @@ import { useSpeechStore } from '../../stores/modules/speech'
 import { useProvidersStore } from '../../stores/providers'
 import { useSettings } from '../../stores/settings'
 import { useSpeechRuntimeStore } from '../../stores/speech-runtime'
+import { createTtsTimestampStripper } from '../../utils/tts-timestamp-stripper'
 import { shouldRunLive2dLipSyncLoop } from './runtime'
 
 const props = withDefaults(defineProps<{
@@ -445,6 +446,7 @@ function setupAnalyser() {
 }
 
 let currentChatIntent: ReturnType<typeof speechRuntimeStore.openIntent> | null = null
+let currentChatTimestampStripper: ReturnType<typeof createTtsTimestampStripper> | null = null
 
 chatHookCleanups.push(onBeforeMessageComposed(async () => {
   playbackManager.stopAll('new-message')
@@ -472,11 +474,15 @@ chatHookCleanups.push(onBeforeMessageComposed(async () => {
     currentChatIntent.cancel('new-message')
     currentChatIntent = null
   }
+  currentChatTimestampStripper = null
 
   currentChatIntent = speechRuntimeStore.openIntent({
     ownerId: activeCardId.value,
     priority: 'normal',
     behavior: 'queue',
+  })
+  currentChatTimestampStripper = createTtsTimestampStripper((value) => {
+    currentChatIntent?.writeLiteral(value)
   })
 }))
 
@@ -485,7 +491,10 @@ chatHookCleanups.push(onBeforeSend(async () => {
 }))
 
 chatHookCleanups.push(onTokenLiteral(async (literal) => {
-  currentChatIntent?.writeLiteral(literal)
+  if (currentChatTimestampStripper)
+    currentChatTimestampStripper.consume(literal)
+  else
+    currentChatIntent?.writeLiteral(literal)
 }))
 
 chatHookCleanups.push(onTokenSpecial(async (special) => {
@@ -495,12 +504,15 @@ chatHookCleanups.push(onTokenSpecial(async (special) => {
 
 chatHookCleanups.push(onStreamEnd(async () => {
   delaysQueue.enqueue(llmInferenceEndToken)
+  currentChatTimestampStripper?.flush()
   currentChatIntent?.writeFlush()
 }))
 
 chatHookCleanups.push(onAssistantResponseEnd(async (_message) => {
+  currentChatTimestampStripper?.flush()
   currentChatIntent?.end()
   currentChatIntent = null
+  currentChatTimestampStripper = null
   // const res = await embed({
   //   ...transformersProvider.embed('Xenova/nomic-embed-text-v1'),
   //   input: message,
