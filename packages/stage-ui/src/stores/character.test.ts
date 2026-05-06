@@ -138,6 +138,52 @@ describe('store character', () => {
     expect(store.reactions).toHaveLength(0)
   })
 
+  it('strips bracketed timestamps from TTS but not the persisted message', async () => {
+    const store = useCharacterStore()
+
+    store.onSparkNotifyReactionStreamEvent('spark-ts', '[2026-05-05 22:32] Hello there')
+    store.onSparkNotifyReactionStreamEnd('spark-ts', '[2026-05-05 22:32] Hello there')
+
+    expect(store.reactions[0]?.message).toBe('[2026-05-05 22:32] Hello there')
+
+    await vi.waitFor(() => {
+      expect(writeFlushSpy).toHaveBeenCalled()
+    })
+
+    const spoken = writeLiteralSpy.mock.calls.map(args => args[0]).join('')
+    expect(spoken).toBe('Hello there')
+    expect(spoken).not.toContain('[')
+  })
+
+  it('strips timestamps split across streamed chunks', async () => {
+    const store = useCharacterStore()
+
+    store.onSparkNotifyReactionStreamEvent('spark-split', '[2026-05-05 ')
+    store.onSparkNotifyReactionStreamEvent('spark-split', '22:32] Hi')
+    store.onSparkNotifyReactionStreamEnd('spark-split', '[2026-05-05 22:32] Hi')
+
+    await vi.waitFor(() => {
+      expect(writeFlushSpy).toHaveBeenCalled()
+    })
+
+    const spoken = writeLiteralSpy.mock.calls.map(args => args[0]).join('')
+    expect(spoken).toBe('Hi')
+  })
+
+  it('preserves non-timestamp bracketed text', async () => {
+    const store = useCharacterStore()
+
+    store.onSparkNotifyReactionStreamEvent('spark-keep', '[note] Hi')
+    store.onSparkNotifyReactionStreamEnd('spark-keep', '[note] Hi')
+
+    await vi.waitFor(() => {
+      expect(writeFlushSpy).toHaveBeenCalled()
+    })
+
+    const spoken = writeLiteralSpy.mock.calls.map(args => args[0]).join('')
+    expect(spoken).toBe('[note] Hi')
+  })
+
   it('clears reactions', () => {
     const store = useCharacterStore()
 

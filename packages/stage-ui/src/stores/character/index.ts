@@ -23,6 +23,43 @@ interface StreamingReactionState {
   reaction: CharacterSparkNotifyReaction
   intent: IntentHandle
   parser: ReturnType<ParserFactory>
+  stripper: ReturnType<typeof createTtsTimestampStripper>
+}
+
+// Bracketed timestamps like `[2026-05-05 22:32]` are prepended to chat history
+// for prefix-cache stability (see chat/datetime-prefix.ts). Weak local models
+// often echo them back into replies; we strip them before TTS so they're never
+// spoken. Streaming-safe: holds back an unmatched trailing `[` until either a
+// closing `]` arrives or enough chars elapse to rule out a timestamp.
+const TTS_TIMESTAMP_RE = /\[\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}(?::\d{2})?\]\s?/g
+const TTS_MAX_BRACKET_LOOKAHEAD = 24
+
+function createTtsTimestampStripper(emit: (value: string) => void) {
+  let buffer = ''
+  return {
+    consume(text: string) {
+      if (!text)
+        return
+      buffer += text
+      let safeUpTo = buffer.length
+      const lastOpen = buffer.lastIndexOf('[')
+      const lastClose = buffer.lastIndexOf(']')
+      if (lastOpen > lastClose && buffer.length - lastOpen < TTS_MAX_BRACKET_LOOKAHEAD)
+        safeUpTo = lastOpen
+      const safePart = buffer.slice(0, safeUpTo).replace(TTS_TIMESTAMP_RE, '')
+      buffer = buffer.slice(safeUpTo)
+      if (safePart)
+        emit(safePart)
+    },
+    flush() {
+      if (!buffer)
+        return
+      const out = buffer.replace(TTS_TIMESTAMP_RE, '')
+      buffer = ''
+      if (out)
+        emit(out)
+    },
+  }
 }
 
 const MAX_REACTIONS = 200
@@ -50,10 +87,11 @@ export const useCharacterStore = defineStore('character', () => {
       behavior: 'queue',
     })
 
+    const stripper = createTtsTimestampStripper(value => intent.writeLiteral(value))
     const parser = parserFactory({
       onLiteral: async (literal) => {
         if (literal)
-          intent.writeLiteral(literal)
+          stripper.consume(literal)
       },
       onSpecial: async (special) => {
         if (special)
@@ -63,6 +101,7 @@ export const useCharacterStore = defineStore('character', () => {
 
     await parser.consume(text)
     await parser.end()
+    stripper.flush()
 
     intent.writeFlush()
     intent.end()
@@ -85,10 +124,11 @@ export const useCharacterStore = defineStore('character', () => {
         behavior: 'interrupt',
       })
 
+      const stripper = createTtsTimestampStripper(value => intent.writeLiteral(value))
       const parser = parserFactory({
         onLiteral: async (literal) => {
           if (literal)
-            intent.writeLiteral(literal)
+            stripper.consume(literal)
         },
         onSpecial: async (special) => {
           if (special)
@@ -96,7 +136,7 @@ export const useCharacterStore = defineStore('character', () => {
         },
       })
 
-      streamingReactions.value.set(sparkEventId, { reaction: newReaction, intent, parser })
+      streamingReactions.value.set(sparkEventId, { reaction: newReaction, intent, parser, stripper })
     }
 
     const state = streamingReactions.value.get(sparkEventId)!
@@ -113,6 +153,7 @@ export const useCharacterStore = defineStore('character', () => {
     recordSparkNotifyReaction(sparkEventId, fullText, { metadata: options?.metadata })
 
     void state.parser.end().then(() => {
+      state.stripper.flush()
       state.intent.writeFlush()
       state.intent.end()
       streamingReactions.value.delete(sparkEventId)
